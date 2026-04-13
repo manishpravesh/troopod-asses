@@ -1,0 +1,11 @@
+.heroGlow {
+  background: radial-gradient(
+    circle at top,
+    rgba(255, 146, 87, 0.25),
+    transparent 65%
+  );
+}
+
+.previewFrame {
+  height: 520px;
+}
