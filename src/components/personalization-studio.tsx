@@ -15,8 +15,10 @@ type ApiResponse =
     };
 
 export function PersonalizationStudio() {
-  const [landingUrl, setLandingUrl] = useState("");
-  const [adUrl, setAdUrl] = useState("");
+  const [landingUrl, setLandingUrl] = useState("https://themeforest.net/");
+  const [adUrl, setAdUrl] = useState(
+    "https://pub-1407f82391df4ab1951418d04be76914.r2.dev/uploads/5e160a52-7599-4172-b93d-c8f8874c5827.png",
+  );
   const [adFile, setAdFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
