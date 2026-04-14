@@ -21,6 +21,7 @@ export function PersonalizationStudio() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<PersonalizationResult | null>(null);
+  const [showOriginalPreview, setShowOriginalPreview] = useState(false);
 
   const fileLabel = useMemo(() => {
     if (!adFile) return "No file selected";
@@ -48,6 +49,7 @@ export function PersonalizationStudio() {
         throw new Error(data.ok ? "Request failed" : data.error);
       }
 
+      setShowOriginalPreview(false);
       setResult(data.result);
     } catch (submissionError) {
       setError(
@@ -211,20 +213,36 @@ export function PersonalizationStudio() {
             ) : null}
           </article>
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <article className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
-              <div className="border-b border-slate-200 px-4 py-3">
-                <h2 className="text-sm font-semibold text-slate-900">
-                  Original preview
-                </h2>
-              </div>
-              <iframe
-                title="Original landing preview"
-                srcDoc={result.originalHtml}
-                sandbox="allow-same-origin"
-                className={`w-full bg-white ${styles.previewFrame}`}
-              />
-            </article>
+          <div className="flex items-center justify-end">
+            <button
+              type="button"
+              onClick={() => setShowOriginalPreview((value) => !value)}
+              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+            >
+              {showOriginalPreview
+                ? "Hide original preview"
+                : "Show original preview"}
+            </button>
+          </div>
+
+          <div
+            className={`grid gap-4 ${showOriginalPreview ? "lg:grid-cols-2" : "lg:grid-cols-1"}`}
+          >
+            {showOriginalPreview ? (
+              <article className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+                <div className="border-b border-slate-200 px-4 py-3">
+                  <h2 className="text-sm font-semibold text-slate-900">
+                    Original preview
+                  </h2>
+                </div>
+                <iframe
+                  title="Original landing preview"
+                  srcDoc={result.originalHtml}
+                  sandbox="allow-same-origin"
+                  className={`w-full bg-white ${styles.previewFrame}`}
+                />
+              </article>
+            ) : null}
 
             <article className="overflow-hidden rounded-2xl border border-orange-200 bg-white">
               <div className="border-b border-orange-200 px-4 py-3">

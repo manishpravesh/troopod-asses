@@ -46,6 +46,13 @@ const STOPWORDS = new Set([
 const GEMINI_ENDPOINT_BASE =
   "https://generativelanguage.googleapis.com/v1beta/models";
 const OPENAI_ENDPOINT = "https://api.openai.com/v1/responses";
+const MODEL_TIMEOUT_MS = 12000;
+const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+const personalizationCache = new Map<
+  string,
+  { expiresAt: number; value: PersonalizationResult }
+>();
 
 function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -138,6 +145,41 @@ function getGeminiResponseText(payload: unknown): string {
   return chunks.join("\n").trim();
 }
 
+function buildCacheKey(args: {
+  landingUrl: string;
+  adUrl?: string;
+  adFileName?: string;
+  adImageDataUrl?: string;
+}): string {
+  const imageHint = args.adImageDataUrl ? args.adImageDataUrl.slice(0, 64) : "";
+
+  return [
+    args.landingUrl,
+    args.adUrl ?? "",
+    args.adFileName ?? "",
+    imageHint,
+  ].join("|");
+}
+
+function getCachedResult(key: string): PersonalizationResult | undefined {
+  const entry = personalizationCache.get(key);
+  if (!entry) return undefined;
+
+  if (entry.expiresAt < Date.now()) {
+    personalizationCache.delete(key);
+    return undefined;
+  }
+
+  return entry.value;
+}
+
+function setCachedResult(key: string, value: PersonalizationResult): void {
+  personalizationCache.set(key, {
+    expiresAt: Date.now() + RESULT_CACHE_TTL_MS,
+    value,
+  });
+}
+
 function parseDataUrl(
   value: string,
 ): { mimeType: string; dataBase64: string } | undefined {
@@ -153,10 +195,9 @@ function parseDataUrl(
 async function fetchImageAsDataUrl(
   imageUrl: string,
 ): Promise<string | undefined> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
     const response = await fetch(imageUrl, {
       method: "GET",
       signal: controller.signal,
@@ -164,8 +205,6 @@ async function fetchImageAsDataUrl(
         Accept: "image/*",
       },
     });
-
-    clearTimeout(timeout);
 
     if (!response.ok) return undefined;
 
@@ -177,6 +216,8 @@ async function fetchImageAsDataUrl(
     return `data:${contentType};base64,${base64}`;
   } catch {
     return undefined;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -252,6 +293,9 @@ async function requestStructuredJsonWithGemini<T>(args: {
     },
   };
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
+
   const response = await fetch(
     `${GEMINI_ENDPOINT_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
     {
@@ -260,8 +304,9 @@ async function requestStructuredJsonWithGemini<T>(args: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     },
-  );
+  ).finally(() => clearTimeout(timeout));
 
   if (!response.ok) {
     return undefined;
@@ -310,6 +355,9 @@ async function requestStructuredJsonWithOpenAI<T>(args: {
     ],
   };
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
+
   const response = await fetch(OPENAI_ENDPOINT, {
     method: "POST",
     headers: {
@@ -317,7 +365,8 @@ async function requestStructuredJsonWithOpenAI<T>(args: {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(payload),
-  });
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
 
   if (!response.ok) {
     return undefined;
@@ -386,7 +435,20 @@ function sanitizeHtmlForPreview(html: string, pageUrl: string): string {
     .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "")
     .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, "")
     .replace(/<object\b[^<]*(?:(?!<\/object>)<[^<]*)*<\/object>/gi, "")
-    .replace(/<embed[^>]*>/gi, "");
+    .replace(/<embed[^>]*>/gi, "")
+    .replace(/<link\b[^>]*rel=["']preload["'][^>]*>/gi, "")
+    .replace(/\ssrcset=("[^"]*"|'[^']*')/gi, "");
+
+  let imageCount = 0;
+  sanitized = sanitized.replace(/<img\b([^>]*)>/gi, (_match, attrs: string) => {
+    imageCount += 1;
+    if (imageCount > 8) {
+      return `<img alt="Preview image omitted" style="display:none" />`;
+    }
+
+    const cleanedAttrs = attrs.replace(/\sloading=("[^"]*"|'[^']*')/gi, "");
+    return `<img${cleanedAttrs} loading="lazy" decoding="async">`;
+  });
 
   const baseTag = `<base href="${escapeHtml(pageUrl)}" />`;
   const hardeningStyle =
@@ -632,19 +694,76 @@ function replaceFirstTagText(args: {
 }): { html: string; before?: string } {
   const regex = new RegExp(
     `<${args.tagName}\\b([^>]*)>([\\s\\S]*?)<\\/${args.tagName}>`,
-    "i",
+    "gi",
   );
-  const match = args.html.match(regex);
-  if (!match) return { html: args.html };
 
-  const before = stripTags(match[2]);
-  if (!before) return { html: args.html };
-  if (args.predicate && !args.predicate(before)) return { html: args.html };
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(args.html)) !== null) {
+    const before = stripTags(match[2]);
+    if (!before) continue;
+    if (args.predicate && !args.predicate(before)) continue;
 
-  const replacement = `<${args.tagName}${match[1]}>${escapeHtml(args.nextText)}</${args.tagName}>`;
+    const start = match.index;
+    const end = regex.lastIndex;
+    const replacement = `<${args.tagName}${match[1]}>${escapeHtml(args.nextText)}</${args.tagName}>`;
+
+    return {
+      html: `${args.html.slice(0, start)}${replacement}${args.html.slice(end)}`,
+      before,
+    };
+  }
+
+  return { html: args.html };
+}
+
+function replaceTitleText(
+  html: string,
+  nextText: string,
+): {
+  html: string;
+  before?: string;
+} {
+  const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (!match) return { html };
+
+  const before = stripTags(match[1]);
+  if (!before) return { html };
+
   return {
-    html: args.html.replace(regex, replacement),
+    html: html.replace(
+      /<title[^>]*>[\s\S]*?<\/title>/i,
+      `<title>${escapeHtml(nextText)}</title>`,
+    ),
     before,
+  };
+}
+
+function injectFallbackBanner(args: {
+  html: string;
+  headline?: string;
+  subheadline?: string;
+  cta?: string;
+}): { html: string; inserted: boolean } {
+  const headline = (args.headline ?? "").trim();
+  const subheadline = (args.subheadline ?? "").trim();
+  const cta = (args.cta ?? "").trim();
+
+  if (!headline && !subheadline && !cta) {
+    return { html: args.html, inserted: false };
+  }
+
+  const banner = `<section data-troopod-fallback="true" style="position:sticky;top:0;z-index:9999;background:#fff7ed;border-bottom:1px solid #fed7aa;padding:12px 16px;font-family:Arial,sans-serif"><div style="max-width:1100px;margin:0 auto"><p style="margin:0;font-size:14px;color:#7c2d12;font-weight:700">${escapeHtml(headline || "Personalized for your ad")}</p>${subheadline ? `<p style="margin:6px 0 0;font-size:13px;color:#9a3412">${escapeHtml(subheadline)}</p>` : ""}${cta ? `<p style="margin:10px 0 0"><a href="#" style="display:inline-block;background:#ea580c;color:#fff;text-decoration:none;padding:8px 12px;border-radius:8px;font-size:13px;font-weight:600">${escapeHtml(cta)}</a></p>` : ""}</div></section>`;
+
+  if (/<body[^>]*>/i.test(args.html)) {
+    return {
+      html: args.html.replace(/<body[^>]*>/i, (match) => `${match}${banner}`),
+      inserted: true,
+    };
+  }
+
+  return {
+    html: `${banner}${args.html}`,
+    inserted: true,
   };
 }
 
@@ -658,13 +777,15 @@ export function applyPersonalization(args: {
   const changes: AppliedChange[] = [];
 
   let personalized = snapshot.safePreviewHtml;
+  const hadH1Before = /<h1\b/i.test(snapshot.safePreviewHtml);
+  const hadCtaBefore = /(<a\b|<button\b)/i.test(snapshot.safePreviewHtml);
 
   if (patch.headline && patch.headline.length <= 140) {
     const replaced = replaceFirstTagText({
       html: personalized,
       tagName: "h1",
       nextText: patch.headline,
-      predicate: (text) => text.length >= 6,
+      predicate: (text) => text.length >= 3,
     });
     personalized = replaced.html;
     if (replaced.before) {
@@ -682,7 +803,7 @@ export function applyPersonalization(args: {
       html: personalized,
       tagName: "p",
       nextText: patch.subheadline,
-      predicate: (text) => text.length >= 25,
+      predicate: (text) => text.length >= 15,
     });
 
     if (!replaced.before) {
@@ -690,7 +811,7 @@ export function applyPersonalization(args: {
         html: personalized,
         tagName: "h2",
         nextText: patch.subheadline,
-        predicate: (text) => text.length >= 20,
+        predicate: (text) => text.length >= 10,
       });
     }
 
@@ -710,7 +831,7 @@ export function applyPersonalization(args: {
       html: personalized,
       tagName: "button",
       nextText: patch.cta,
-      predicate: (text) => text.length <= 80,
+      predicate: (text) => text.length >= 2 && text.length <= 120,
     });
 
     if (!replaced.before) {
@@ -718,7 +839,23 @@ export function applyPersonalization(args: {
         html: personalized,
         tagName: "a",
         nextText: patch.cta,
-        predicate: (text) => text.length <= 80,
+        predicate: (text) => {
+          const normalized = text.toLowerCase();
+          return (
+            text.length >= 2 &&
+            text.length <= 120 &&
+            CTA_KEYWORDS.some((keyword) => normalized.includes(keyword))
+          );
+        },
+      });
+    }
+
+    if (!replaced.before) {
+      replaced = replaceFirstTagText({
+        html: personalized,
+        tagName: "a",
+        nextText: patch.cta,
+        predicate: (text) => text.length >= 2 && text.length <= 120,
       });
     }
 
@@ -744,7 +881,7 @@ export function applyPersonalization(args: {
         if (index >= nextBullets.length) return match;
 
         const before = stripTags(inner);
-        if (before.length < 15) return match;
+        if (before.length < 8) return match;
 
         const after = nextBullets[index];
         index += 1;
@@ -762,11 +899,49 @@ export function applyPersonalization(args: {
     );
   }
 
-  if (!/<h1\b/i.test(personalized)) {
+  if (changes.length === 0 && patch.headline) {
+    const titleReplacement = replaceTitleText(personalized, patch.headline);
+    personalized = titleReplacement.html;
+    if (titleReplacement.before) {
+      changes.push({
+        zone: "headline",
+        before: titleReplacement.before,
+        after: patch.headline,
+        reason:
+          patch.rationales[0] ?? "Improve message match in document title.",
+      });
+    }
+  }
+
+  if (changes.length === 0) {
+    const fallback = injectFallbackBanner({
+      html: personalized,
+      headline: patch.headline,
+      subheadline: patch.subheadline,
+      cta: patch.cta,
+    });
+
+    personalized = fallback.html;
+    if (fallback.inserted) {
+      changes.push({
+        zone: "headline",
+        before: "No reliable editable hero slot",
+        after: patch.headline ?? "Personalized hero banner",
+        reason:
+          patch.rationales[0] ??
+          "Inserted safe personalization banner because page structure was restrictive.",
+      });
+      warnings.push(
+        "Used fallback banner because standard editable slots were limited on this page.",
+      );
+    }
+  }
+
+  if (hadH1Before && !/<h1\b/i.test(personalized)) {
     warnings.push("Guardrail rollback: missing H1 after patching.");
   }
 
-  if (!/(<a\b|<button\b)/i.test(personalized)) {
+  if (hadCtaBefore && !/(<a\b|<button\b)/i.test(personalized)) {
     warnings.push("Guardrail rollback: missing CTA element after patching.");
   }
 
@@ -805,13 +980,21 @@ export async function runPersonalization(args: {
   adFileName?: string;
   adImageDataUrl?: string;
 }): Promise<PersonalizationResult> {
-  const snapshot = await extractLandingSnapshot(args.landingUrl);
-  const adInsight = await analyzeAdCreative({
-    adUrl: args.adUrl,
-    adFileName: args.adFileName,
-    adImageDataUrl: args.adImageDataUrl,
-  });
+  const cacheKey = buildCacheKey(args);
+  const cached = getCachedResult(cacheKey);
+  if (cached) return cached;
+
+  const [snapshot, adInsight] = await Promise.all([
+    extractLandingSnapshot(args.landingUrl),
+    analyzeAdCreative({
+      adUrl: args.adUrl,
+      adFileName: args.adFileName,
+      adImageDataUrl: args.adImageDataUrl,
+    }),
+  ]);
 
   const patch = await buildPersonalizationPatch({ snapshot, adInsight });
-  return applyPersonalization({ snapshot, patch, adInsight });
+  const result = applyPersonalization({ snapshot, patch, adInsight });
+  setCachedResult(cacheKey, result);
+  return result;
 }
